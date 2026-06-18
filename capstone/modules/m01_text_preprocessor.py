@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 
-_APOSTROPHE_RE = re.compile(r"['’‘]")
+_APOSTROPHE_RE = re.compile(r"['’‘ʼʻ`´]")
 _TOKEN_RE = re.compile(r"[a-z][a-z']*")
 
 _DEFAULT_STOPWORDS: frozenset[str] = frozenset({
