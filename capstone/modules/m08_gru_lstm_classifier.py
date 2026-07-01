@@ -1,26 +1,30 @@
 """
 capstone/modules/m08_gru_lstm_classifier.py
-GRULSTMClassifier — GRU yoki LSTM asosida matn (sentiment) tasniflash va taqqoslash.
-Shartnoma: capstone/contracts.py :: GRULSTMClassifier
-P8 (9-kun amaliyoti) da qurilgan; m01 (TextPreprocessor) ustiga quriladi.
-Consumed by: m13 (baseline vs BERT), Day 16 (pipeline).
 
-torch SHART EMAS (m07 ixtiyoriy-kutubxona namunasi):
-  - Kaggle yo'li: nn.Embedding + nn.LSTM/nn.GRU(num_layers) + nn.Linear, CrossEntropyLoss + Adam.
-  - Offline yo'l (torch'siz): tasodifiy-init GRU/LSTM forward (reservoir) + sklearn LogReg readout
-    -- mo'rt BPTT'siz, ishonchli. Forward dinamikasi haqiqiy GRU/LSTM.
-HAS_TORCH bayrog'i yo'lni tanlaydi. Yorliqlar: 'ijobiy' / 'salbiy' (qulflangan).
+GRUClassifier, LSTMClassifier, and GRULSTMClassifier for Uzbek sentiment
+classification. The separate classes make the architecture distinction explicit;
+GRULSTMClassifier remains the capstone contract wrapper used for comparison.
+
+Torch path:
+  nn.Embedding + nn.GRU/nn.LSTM + nn.Linear, CrossEntropyLoss + Adam.
+
+Offline path:
+  Random recurrent GRU/LSTM-style encoder (reservoir) + tiny softmax readout.
+  This keeps the notebook runnable without torch or sklearn while preserving the
+  gate dynamics students just studied.
 """
 from __future__ import annotations
 
 import pickle
 import time
+from dataclasses import dataclass
 
 import numpy as np
 
 try:
     import torch
     import torch.nn as nn
+
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
@@ -35,191 +39,377 @@ def _sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Kaggle yo'li: PyTorch GRU/LSTM klassifikatori
-# ─────────────────────────────────────────────────────────────────────────────
+def _macro_f1(y_true, y_pred):
+    scores = []
+    for label in sorted(set(y_true) | set(y_pred)):
+        true_positive = sum(t == label and p == label for t, p in zip(y_true, y_pred))
+        false_positive = sum(t != label and p == label for t, p in zip(y_true, y_pred))
+        false_negative = sum(t == label and p != label for t, p in zip(y_true, y_pred))
+        precision = true_positive / max(true_positive + false_positive, 1)
+        recall = true_positive / max(true_positive + false_negative, 1)
+        scores.append(2 * precision * recall / max(precision + recall, 1e-12))
+    return float(np.mean(scores))
+
+
+class _SoftmaxReadout:
+    """Small sklearn-free multinomial readout for offline notebooks."""
+
+    def __init__(self, epochs=250, lr=0.2):
+        self.epochs = epochs
+        self.lr = lr
+        self.W = None
+        self.b = None
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=int)
+        n_examples, n_features = X.shape
+        n_classes = int(y.max()) + 1
+        self.W = np.zeros((n_features, n_classes))
+        self.b = np.zeros(n_classes)
+
+        for _ in range(self.epochs):
+            logits = X @ self.W + self.b
+            logits -= logits.max(axis=1, keepdims=True)
+            probs = np.exp(logits)
+            probs /= probs.sum(axis=1, keepdims=True)
+            probs[np.arange(n_examples), y] -= 1.0
+            self.W -= self.lr * (X.T @ probs) / n_examples
+            self.b -= self.lr * probs.mean(axis=0)
+        return self
+
+    def predict_proba(self, X):
+        X = np.asarray(X, dtype=float)
+        logits = X @ self.W + self.b
+        logits -= logits.max(axis=1, keepdims=True)
+        probs = np.exp(logits)
+        return probs / probs.sum(axis=1, keepdims=True)
+
+    def predict(self, X):
+        return np.argmax(self.predict_proba(X), axis=1)
+
+
 if HAS_TORCH:
-    class _TorchSeq(nn.Module):
-        def __init__(self, vocab, dim, hidden, n_layers, n_cls, arch):
+
+    class _TorchSequenceNet(nn.Module):
+        def __init__(self, vocab_size, embed_dim, hidden_size, num_layers, n_classes, arch):
             super().__init__()
-            self.emb = nn.Embedding(vocab, dim, padding_idx=0)
+            self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
             rnn_cls = nn.LSTM if arch == "lstm" else nn.GRU
-            self.rnn = rnn_cls(dim, hidden, num_layers=n_layers, batch_first=True)
-            self.out = nn.Linear(hidden, n_cls)
+            self.recurrent = rnn_cls(
+                embed_dim,
+                hidden_size,
+                num_layers=num_layers,
+                batch_first=True,
+            )
+            self.output = nn.Linear(hidden_size, n_classes)
             self.arch = arch
 
-        def forward(self, x):
-            e = self.emb(x)
-            out, h = self.rnn(e)
-            last = h[0] if self.arch == "lstm" else h     # LSTM: (h, c)
-            return self.out(last[-1])                      # oxirgi qatlam h_T
+        def forward(self, token_ids):
+            embedded = self.embedding(token_ids)
+            _, hidden = self.recurrent(embedded)
+            last_hidden = hidden[0] if self.arch == "lstm" else hidden
+            return self.output(last_hidden[-1])
 
 
-class GRULSTMClassifier:
-    """GRU yoki LSTM bilan matn tasnifi va GRU-vs-LSTM taqqoslash.
+@dataclass
+class _TrainingConfig:
+    epochs: int = 10
+    hidden_size: int = 128
+    num_layers: int = 2
+    lr: float = 1e-3
 
-    Consumed by: m13 (baseline vs BERT), Day 16 (pipeline).
-    """
+
+class _BaseSequenceClassifier:
+    """Shared implementation for the concrete GRU and LSTM classifiers."""
+
+    arch = ""
 
     def __init__(self, embed_dim: int = 32) -> None:
         self._pre = TextPreprocessor()
         self._dim = embed_dim
         self._w2i: dict[str, int] = {}
         self._labels: list[str] = []
-        self._arch = "lstm"
-        self._hidden = 128
-        self._layers = 2
-        self._model = None          # torch
-        self._np = None             # offline: {arch, reservoir, readout}
-        self._train_cache = None    # (seqs, ys) -- compare_report uchun
+        self._config = _TrainingConfig()
+        self._model = None
+        self._np = None
+        self._train_cache = None
 
-    # ─── kodlash ──────────────────────────────────────────────────────────────
-    def _encode(self, text: str) -> list[int]:
-        toks = self._pre.preprocess(text) if text.strip() else []
-        ids = [self._w2i[t] for t in toks if t in self._w2i]
-        return ids if ids else [0]
+    def _tokenize(self, text: str) -> list[str]:
+        return self._pre.preprocess(text) if text.strip() else []
 
     def _prepare(self, texts, labels):
-        token_lists = [self._pre.preprocess(t) if t.strip() else [] for t in texts]
-        vocab = sorted({t for toks in token_lists for t in toks})
-        self._w2i = {w: i + 1 for i, w in enumerate(vocab)}
+        token_lists = [self._tokenize(text) for text in texts]
+        vocab = sorted({token for tokens in token_lists for token in tokens})
+        self._w2i = {word: index + 1 for index, word in enumerate(vocab)}
         self._labels = sorted(set(labels))
-        l2i = {lab: i for i, lab in enumerate(self._labels)}
-        seqs = [[self._w2i[t] for t in toks if t in self._w2i] or [0] for toks in token_lists]
-        ys = [l2i[lab] for lab in labels]
-        return seqs, ys
+        label_to_index = {label: index for index, label in enumerate(self._labels)}
+        sequences = [
+            [self._w2i[token] for token in tokens if token in self._w2i] or [0]
+            for tokens in token_lists
+        ]
+        y = [label_to_index[label] for label in labels]
+        return sequences, y
 
-    # ─── o'qitish ─────────────────────────────────────────────────────────────
-    def fit(self, texts: list[str], labels: list[str], arch: str = "lstm",
-            epochs: int = 10, hidden_size: int = 128, num_layers: int = 2,
-            lr: float = 1e-3) -> None:
-        """GRU yoki LSTM klassifikatorini o'qitadi (arch='lstm'|'gru')."""
-        self._arch, self._hidden, self._layers = arch, hidden_size, num_layers
-        seqs, ys = self._prepare(texts, labels)
-        self._train_cache = (seqs, ys, epochs, hidden_size, num_layers, lr)
+    def _encode(self, text: str) -> list[int]:
+        token_ids = [self._w2i[token] for token in self._tokenize(text) if token in self._w2i]
+        return token_ids or [0]
+
+    @staticmethod
+    def _pad(sequences):
+        max_len = max(len(sequence) for sequence in sequences)
+        return [sequence + [0] * (max_len - len(sequence)) for sequence in sequences]
+
+    def fit(
+        self,
+        texts: list[str],
+        labels: list[str],
+        epochs: int = 10,
+        hidden_size: int = 128,
+        num_layers: int = 2,
+        lr: float = 1e-3,
+    ) -> None:
+        self._config = _TrainingConfig(epochs, hidden_size, num_layers, lr)
+        sequences, y = self._prepare(texts, labels)
+        self._train_cache = (list(texts), list(labels))
+
         if HAS_TORCH:
-            self._model = self._fit_torch(seqs, ys, arch, epochs, hidden_size, num_layers, lr)
+            self._fit_torch(sequences, y)
         else:
-            self._np = self._fit_numpy(seqs, ys, arch, hidden_size)
+            self._fit_numpy(sequences, y)
 
-    def _pad(self, seqs):
-        T = max(len(s) for s in seqs)
-        return [s + [0] * (T - len(s)) for s in seqs]
-
-    def _fit_torch(self, seqs, ys, arch, epochs, hidden, layers, lr):
+    def _fit_torch(self, sequences, y):
         torch.manual_seed(42)
-        X = torch.tensor(self._pad(seqs), dtype=torch.long)
-        y = torch.tensor(ys, dtype=torch.long)
-        model = _TorchSeq(len(self._w2i) + 1, self._dim, hidden, layers, len(self._labels), arch)
-        opt = torch.optim.Adam(model.parameters(), lr=lr)
+        X = torch.tensor(self._pad(sequences), dtype=torch.long)
+        y_tensor = torch.tensor(y, dtype=torch.long)
+        self._model = _TorchSequenceNet(
+            len(self._w2i) + 1,
+            self._dim,
+            self._config.hidden_size,
+            self._config.num_layers,
+            len(self._labels),
+            self.arch,
+        )
+        optimizer = torch.optim.Adam(self._model.parameters(), lr=self._config.lr)
         loss_fn = nn.CrossEntropyLoss()
-        model.train()
-        for _ in range(epochs):
-            opt.zero_grad()
-            loss = loss_fn(model(X), y)
+        self._model.train()
+        for _ in range(self._config.epochs):
+            optimizer.zero_grad()
+            loss = loss_fn(self._model(X), y_tensor)
             loss.backward()
-            opt.step()
-        model.eval()
-        return model
+            optimizer.step()
+        self._model.eval()
 
-    # offline: tasodifiy-init rekurrent enkoder (reservoir) + LogReg readout
-    def _reservoir(self, arch, hidden):
+    def _new_reservoir(self):
         rng = np.random.RandomState(42)
-        V, d, H = len(self._w2i) + 1, self._dim, hidden
-        P = {"E": rng.randn(V, d) * 0.3}
-        n_gate = 4 if arch == "lstm" else 3
-        P["W"] = rng.randn(n_gate, H, H + d) * (1.0 / np.sqrt(H + d))
-        P["arch"], P["H"] = arch, H
-        return P
+        vocab_size = len(self._w2i) + 1
+        embed_dim = self._dim
+        hidden_size = self._config.hidden_size
+        n_gates = 4 if self.arch == "lstm" else 3
+        return {
+            "E": rng.randn(vocab_size, embed_dim) * 0.3,
+            "W": rng.randn(n_gates, hidden_size, hidden_size + embed_dim)
+            * (1.0 / np.sqrt(hidden_size + embed_dim)),
+            "hidden_size": hidden_size,
+            "arch": self.arch,
+        }
 
-    def _encode_state(self, P, seq):
-        H, d, arch = P["H"], self._dim, P["arch"]
-        h = np.zeros(H); c = np.zeros(H)
-        for tid in seq:
-            z = np.concatenate([h, P["E"][tid]])
-            if arch == "lstm":
-                f = _sigmoid(P["W"][0] @ z); i = _sigmoid(P["W"][1] @ z)
-                o = _sigmoid(P["W"][2] @ z); g = np.tanh(P["W"][3] @ z)
-                c = f * c + i * g; h = o * np.tanh(c)
-            else:  # gru
-                zt = _sigmoid(P["W"][0] @ z); r = _sigmoid(P["W"][1] @ z)
-                zr = np.concatenate([r * h, P["E"][tid]])
-                ht = np.tanh(P["W"][2] @ zr); h = (1 - zt) * h + zt * ht
-        return h
+    def _encode_state(self, reservoir, sequence):
+        hidden_size = reservoir["hidden_size"]
+        hidden_state = np.zeros(hidden_size)
+        cell_state = np.zeros(hidden_size)
 
-    def _fit_numpy(self, seqs, ys, arch, hidden):
-        from sklearn.linear_model import LogisticRegression
-        P = self._reservoir(arch, hidden)
-        Hs = np.array([self._encode_state(P, s) for s in seqs])
-        clf = LogisticRegression(max_iter=1000)
-        clf.fit(Hs, ys)
-        return {"reservoir": P, "readout": clf}
+        for token_id in sequence:
+            embedded_token = reservoir["E"][token_id]
+            if reservoir["arch"] == "lstm":
+                joined = np.concatenate([hidden_state, embedded_token])
+                forget_gate = _sigmoid(reservoir["W"][0] @ joined)
+                input_gate = _sigmoid(reservoir["W"][1] @ joined)
+                output_gate = _sigmoid(reservoir["W"][2] @ joined)
+                candidate = np.tanh(reservoir["W"][3] @ joined)
+                cell_state = forget_gate * cell_state + input_gate * candidate
+                hidden_state = output_gate * np.tanh(cell_state)
+            else:
+                joined = np.concatenate([hidden_state, embedded_token])
+                update_gate = _sigmoid(reservoir["W"][0] @ joined)
+                reset_gate = _sigmoid(reservoir["W"][1] @ joined)
+                candidate_input = np.concatenate([reset_gate * hidden_state, embedded_token])
+                candidate = np.tanh(reservoir["W"][2] @ candidate_input)
+                hidden_state = (1 - update_gate) * hidden_state + update_gate * candidate
 
-    # ─── bashorat ─────────────────────────────────────────────────────────────
-    def _proba(self, text):
-        ids = self._encode(text)
+        return hidden_state
+
+    def _fit_numpy(self, sequences, y):
+        reservoir = self._new_reservoir()
+        states = np.array([self._encode_state(reservoir, sequence) for sequence in sequences])
+        readout = _SoftmaxReadout().fit(states, y)
+        self._np = {"reservoir": reservoir, "readout": readout}
+        self._model = None
+
+    def _proba(self, text: str) -> np.ndarray:
+        token_ids = self._encode(text)
         if HAS_TORCH and self._model is not None:
             with torch.no_grad():
-                z = self._model(torch.tensor([ids], dtype=torch.long))[0].numpy()
-            e = np.exp(z - z.max()); return e / e.sum()
-        h = self._encode_state(self._np["reservoir"], ids)
-        return self._np["readout"].predict_proba([h])[0]
+                logits = self._model(torch.tensor([token_ids], dtype=torch.long))[0].numpy()
+            probs = np.exp(logits - logits.max())
+            return probs / probs.sum()
+
+        state = self._encode_state(self._np["reservoir"], token_ids)
+        return self._np["readout"].predict_proba([state])[0]
 
     def predict(self, text: str) -> str:
         return self._labels[int(np.argmax(self._proba(text)))]
 
-    # ─── GRU vs LSTM taqqoslash ─────────────────────────────────────────────────
-    def compare_report(self) -> dict:
-        """Ikkala arxitekturani bir xil vazifada o'qitib taqqoslaydi.
+    def predict_proba(self, text: str) -> dict[str, float]:
+        probs = self._proba(text)
+        return {label: float(probs[index]) for index, label in enumerate(self._labels)}
 
-        Returns: {'lstm': {f1, accuracy, inference_time}, 'gru': {...}}.
-        """
-        from sklearn.metrics import f1_score
-        assert self._train_cache is not None, "Avval fit() chaqiring."
-        seqs, ys, epochs, hidden, layers, lr = self._train_cache
-        report: dict = {}
-        for arch in ("lstm", "gru"):
-            if HAS_TORCH:
-                model = self._fit_torch(seqs, ys, arch, epochs, hidden, layers, lr)
-                X = torch.tensor(self._pad(seqs), dtype=torch.long)
-                t0 = time.perf_counter()
-                with torch.no_grad():
-                    preds = model(X).argmax(1).numpy()
-                infer = time.perf_counter() - t0
-            else:
-                np_state = self._fit_numpy(seqs, ys, arch, hidden)
-                Hs = np.array([self._encode_state(np_state["reservoir"], s) for s in seqs])
-                t0 = time.perf_counter()
-                preds = np_state["readout"].predict(Hs)
-                infer = time.perf_counter() - t0
-            acc = float(np.mean(preds == np.array(ys)))
-            f1 = float(f1_score(ys, preds, average="macro"))
-            report[arch] = {"f1": round(f1, 4), "accuracy": round(acc, 4),
-                            "inference_time": round(infer, 4)}
-        return report
+    def evaluate(self, texts: list[str], labels: list[str]) -> dict[str, float]:
+        start = time.perf_counter()
+        predictions = [self.predict(text) for text in texts]
+        inference_ms = (time.perf_counter() - start) * 1000 / max(len(texts), 1)
+        accuracy = float(np.mean(np.array(predictions) == np.array(labels)))
+        return {
+            "f1": round(_macro_f1(labels, predictions), 4),
+            "accuracy": round(accuracy, 4),
+            "inference_time": round(inference_ms, 4),
+        }
 
-    # ─── saqlash / yuklash ──────────────────────────────────────────────────────
     def save(self, path: str) -> None:
-        state = {"w2i": self._w2i, "labels": self._labels, "dim": self._dim,
-                 "arch": self._arch, "hidden": self._hidden, "layers": self._layers,
-                 "has_torch": HAS_TORCH}
+        state = {
+            "w2i": self._w2i,
+            "labels": self._labels,
+            "dim": self._dim,
+            "config": self._config,
+            "arch": self.arch,
+            "has_torch": HAS_TORCH,
+        }
         if HAS_TORCH and self._model is not None:
             state["torch"] = self._model.state_dict()
         else:
             state["np"] = self._np
-        with open(path, "wb") as f:
-            pickle.dump(state, f)
+        with open(path, "wb") as file:
+            pickle.dump(state, file)
 
     def load(self, path: str) -> None:
-        with open(path, "rb") as f:
-            s = pickle.load(f)
-        self._w2i, self._labels = s["w2i"], s["labels"]
-        self._dim, self._arch = s["dim"], s["arch"]
-        self._hidden, self._layers = s["hidden"], s["layers"]
-        if HAS_TORCH and "torch" in s:
-            self._model = _TorchSeq(len(self._w2i) + 1, self._dim, self._hidden,
-                                    self._layers, len(self._labels), self._arch)
-            self._model.load_state_dict(s["torch"]); self._model.eval()
+        with open(path, "rb") as file:
+            state = pickle.load(file)
+        self._w2i = state["w2i"]
+        self._labels = state["labels"]
+        self._dim = state["dim"]
+        self._config = state["config"]
+
+        if HAS_TORCH and "torch" in state:
+            self._model = _TorchSequenceNet(
+                len(self._w2i) + 1,
+                self._dim,
+                self._config.hidden_size,
+                self._config.num_layers,
+                len(self._labels),
+                self.arch,
+            )
+            self._model.load_state_dict(state["torch"])
+            self._model.eval()
             self._np = None
         else:
-            self._np = s.get("np"); self._model = None
+            self._np = state.get("np")
+            self._model = None
+
+
+class GRUClassifier(_BaseSequenceClassifier):
+    """GRU-only sentiment classifier."""
+
+    arch = "gru"
+
+
+class LSTMClassifier(_BaseSequenceClassifier):
+    """LSTM-only sentiment classifier."""
+
+    arch = "lstm"
+
+
+class GRULSTMClassifier:
+    """Capstone wrapper: train one architecture and compare GRU vs LSTM."""
+
+    def __init__(self, embed_dim: int = 32) -> None:
+        self._dim = embed_dim
+        self._active = LSTMClassifier(embed_dim=embed_dim)
+        self._train_args = None
+        self._w2i: dict[str, int] = {}
+        self._labels: list[str] = []
+        self._arch = "lstm"
+
+    def _new_model(self, arch: str):
+        if arch == "lstm":
+            return LSTMClassifier(embed_dim=self._dim)
+        if arch == "gru":
+            return GRUClassifier(embed_dim=self._dim)
+        raise ValueError("arch must be 'lstm' or 'gru'")
+
+    def _sync_public_state(self):
+        self._w2i = self._active._w2i
+        self._labels = self._active._labels
+        self._arch = self._active.arch
+
+    def fit(
+        self,
+        texts: list[str],
+        labels: list[str],
+        arch: str = "lstm",
+        epochs: int = 10,
+        hidden_size: int = 128,
+        num_layers: int = 2,
+        lr: float = 1e-3,
+    ) -> None:
+        self._active = self._new_model(arch)
+        self._active.fit(
+            texts,
+            labels,
+            epochs=epochs,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            lr=lr,
+        )
+        self._train_args = (list(texts), list(labels), epochs, hidden_size, num_layers, lr)
+        self._sync_public_state()
+
+    def predict(self, text: str) -> str:
+        return self._active.predict(text)
+
+    def predict_proba(self, text: str) -> dict[str, float]:
+        return self._active.predict_proba(text)
+
+    def compare_report(self) -> dict:
+        assert self._train_args is not None, "Avval fit() chaqiring."
+        texts, labels, epochs, hidden_size, num_layers, lr = self._train_args
+        report = {}
+        for arch, model_cls in (("lstm", LSTMClassifier), ("gru", GRUClassifier)):
+            model = model_cls(embed_dim=self._dim)
+            model.fit(
+                texts,
+                labels,
+                epochs=epochs,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                lr=lr,
+            )
+            report[arch] = model.evaluate(texts, labels)
+        return report
+
+    def save(self, path: str) -> None:
+        state = {
+            "dim": self._dim,
+            "arch": self._arch,
+            "train_args": self._train_args,
+            "active": self._active,
+        }
+        with open(path, "wb") as file:
+            pickle.dump(state, file)
+
+    def load(self, path: str) -> None:
+        with open(path, "rb") as file:
+            state = pickle.load(file)
+        self._dim = state["dim"]
+        self._train_args = state["train_args"]
+        self._active = state["active"]
+        self._sync_public_state()
